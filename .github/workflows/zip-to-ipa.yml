@@ -1,0 +1,157 @@
+name: zip-to-ipa
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Direct download URL of the .zip (containing a .app or Payload/.app)'
+        required: true
+      tag:
+        description: 'Release tag (created if missing)'
+        required: true
+        default: 'v1.0'
+      asset_name:
+        description: 'Optional IPA filename (defaults to <AppName>.ipa)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup
+        run: |
+          mkdir -p work
+          cd work
+          curl -L --fail -o input.zip "${{ inputs.url }}"
+          ls -la input.zip
+
+      - name: Extract
+        run: |
+          cd work
+          unzip -q input.zip -d extracted
+          # remove macOS metadata
+          rm -rf extracted/__MACOSX || true
+          find extracted -name '.DS_Store' -delete || true
+
+      - name: Locate .app
+        id: locate
+        run: |
+          cd work
+          APP_PATH=$(find extracted -type d -name '*.app' -not -path '*/__MACOSX/*' | head -n1)
+          if [ -z "$APP_PATH" ]; then
+            echo "No .app found in zip" >&2
+            exit 1
+          fi
+          APP_NAME=$(basename "$APP_PATH")
+          BASE_NAME="${APP_NAME%.app}"
+          echo "app_path=$APP_PATH" >> "$GITHUB_OUTPUT"
+          echo "app_name=$APP_NAME" >> "$GITHUB_OUTPUT"
+          echo "base_name=$BASE_NAME" >> "$GITHUB_OUTPUT"
+          echo "Found: $APP_PATH"
+
+      - name: Build IPA
+        id: build
+        run: |
+          cd work
+          python3 - <<'PY'
+          import os, plistlib, zipfile, sys
+          app_path = "${{ steps.locate.outputs.app_path }}"
+          app_name = "${{ steps.locate.outputs.app_name }}"
+          base = "${{ steps.locate.outputs.base_name }}"
+          requested = "${{ inputs.asset_name }}".strip()
+          out_name = requested if requested else f"{base}.ipa"
+          if not out_name.lower().endswith(".ipa"):
+              out_name += ".ipa"
+          out_ipa = os.path.abspath(out_name)
+
+          # Find main executable from Info.plist
+          info_plist = os.path.join(app_path, "Info.plist")
+          main_exe = base
+          try:
+              with open(info_plist, "rb") as f:
+                  pl = plistlib.load(f)
+              main_exe = pl.get("CFBundleExecutable", base)
+          except Exception as e:
+              print("Info.plist read warn:", e)
+          print("Main executable:", main_exe)
+
+          EXEC_EXTS = {".dylib", ".so"}
+          def is_exec(rel, name):
+              if name == main_exe and "/" not in rel.strip("/").replace(app_name + "/", "", 1):
+                  return True
+              ext = os.path.splitext(name)[1].lower()
+              if ext in EXEC_EXTS:
+                  return True
+              # any file directly inside Frameworks/*.framework/ that has no extension
+              parts = rel.split("/")
+              if len(parts) >= 4 and parts[1] == "Frameworks" and parts[2].endswith(".framework") and "." not in parts[-1]:
+                  return True
+              return False
+
+          with zipfile.ZipFile(out_ipa, "w", zipfile.ZIP_DEFLATED) as z:
+              # Walk the .app preserving symlinks where possible
+              for root, dirs, files in os.walk(app_path, followlinks=False):
+                  rel_root = os.path.relpath(root, os.path.dirname(app_path))
+                  for d in dirs:
+                      full = os.path.join(root, d)
+                      arc = "Payload/" + os.path.relpath(full, os.path.dirname(app_path)).replace(os.sep, "/") + "/"
+                      if os.path.islink(full):
+                          zi = zipfile.ZipInfo(arc.rstrip("/"))
+                          zi.create_system = 3
+                          zi.external_attr = (0o120755 << 16)
+                          z.writestr(zi, os.readlink(full))
+                      else:
+                          zi = zipfile.ZipInfo(arc)
+                          zi.external_attr = (0o40755 << 16) | 0x10
+                          z.writestr(zi, b"")
+                  for fn in files:
+                      full = os.path.join(root, fn)
+                      arc = "Payload/" + os.path.relpath(full, os.path.dirname(app_path)).replace(os.sep, "/")
+                      if os.path.islink(full):
+                          zi = zipfile.ZipInfo(arc)
+                          zi.create_system = 3
+                          zi.external_attr = (0o120755 << 16)
+                          z.writestr(zi, os.readlink(full))
+                          continue
+                      with open(full, "rb") as fh:
+                          data = fh.read()
+                      zi = zipfile.ZipInfo(arc)
+                      mode = 0o100755 if is_exec(arc, fn) else 0o100644
+                      zi.external_attr = mode << 16
+                      zi.compress_type = zipfile.ZIP_DEFLATED
+                      z.writestr(zi, data)
+
+          size = os.path.getsize(out_ipa)
+          print("Built:", out_ipa, size, "bytes")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"ipa_path={out_ipa}\n")
+              f.write(f"ipa_name={out_name}\n")
+          PY
+
+      - name: Ensure release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh release view "${{ inputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "${{ inputs.tag }}" --repo "$GITHUB_REPOSITORY" --title "${{ inputs.tag }}" --notes "Auto-built IPAs"
+          fi
+
+      - name: Upload IPA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd work
+          gh release upload "${{ inputs.tag }}" "${{ steps.build.outputs.ipa_path }}" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "Uploaded: ${{ steps.build.outputs.ipa_name }} -> ${{ inputs.tag }}"
+
+      - name: Summary
+        run: |
+          echo "### IPA built and uploaded" >> $GITHUB_STEP_SUMMARY
+          echo "- Source: ${{ inputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Asset: ${{ steps.build.outputs.ipa_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Release: ${{ inputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- URL: https://github.com/$GITHUB_REPOSITORY/releases/download/${{ inputs.tag }}/${{ steps.build.outputs.ipa_name }}" >> $GITHUB_STEP_SUMMARY
